@@ -5,7 +5,8 @@ import utils
 from time import sleep
 
 def main():
-    with utils.Sqlite3Conn("nf.db") as sq:
+    with utils.DBBroker("nf.db") as sq:
+        sq.intialize()
         c = sq.conn.cursor()
         try:
             c.execute("""
@@ -39,14 +40,15 @@ def main():
         print r['id']
 
 
-def get_token(u, p, algorithm='md5'):
-    t = utils.SimpleAuth()
-    return t.get_token(u, p)
+def get_token(auth, u, p, algorithm='md5'):
+    return auth.get_token(u, p)
 
 if __name__ == '__main__':
-    main()
-    #print get_token('devops', 'Passw0rd')
-    get_token('devops2', 'Passw0rd')
-    t = get_token('devops', 'Passw0rd')
+    #main()
+    auth = utils.SimpleAuth()
+    print get_token(auth, 'devops', 'Passw0rd')
+    print get_token(auth, 'devops2', 'Passw0rd')
+    t = get_token(auth, 'devops', 'Passw0rd')
     sleep(2)
-    print utils.SimpleAuth().validate_token(t)
+    print t
+    print auth.validate_token(t)
