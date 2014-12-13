@@ -5,32 +5,35 @@ import utils
 from time import sleep
 
 def main():
-    with utils.DBBroker("nf.db") as sq:
-        sq.intialize()
-        c = sq.conn.cursor()
+    db_file = "/Users/lafengnan/codes/Github/maintenance/nf.db"
+    with utils.AuthBroker(db_file) as sq:
         try:
-            c.execute("""
+            sq.execute_sql("""
                       CREATE TABLE event
                       (id int, services text)
                       """)
+            sq.commit()
         except utils.sqlite3.OperationalError as e:
-            c.execute('''
+            sq.execute_sql('''
                       DROP TABLE event
                       ''')
-            c.execute('''
+            sq.execute_sql('''
                       CREATE TABLE event
                       (id int, services text)
                       ''')
+
+            sq.commit()
         v = [(1, 'storage'),
              (2, 'metadata')
              ]
-        c.executemany('''
+        sq.conn.cursor().executemany('''
                   INSERT INTO event VALUES(?,?)
                   ''', v)
+        sq.commit()
         table = 'event'
         query = '''SELECT * from %s''' % table
         print sq.execute_sql(query)
-        ids = c.execute('''
+        ids = sq.execute_sql('''
                  SELECT * from event
                  ''')
         for r in ids:
@@ -44,7 +47,7 @@ def get_token(auth, u, p, algorithm='md5'):
     return auth.get_token(u, p)
 
 if __name__ == '__main__':
-    #main()
+    main()
     auth = utils.SimpleAuth()
     print get_token(auth, 'devops', 'Passw0rd')
     print get_token(auth, 'devops2', 'Passw0rd')

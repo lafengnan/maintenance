@@ -82,9 +82,13 @@ class Cache(object):
     def ishit(self, user, token):
         return token == self.cache.get(user)
 
+    def dump(self):
+        pass #TODO
+
 class DBBroker(object):
     """
-    DBBroker is broker class of sqlite3 connection
+    DBBroker is top broker class of sqlite3 connection, it should not 
+    be used directly. Any new table to create, please inherit it for usage.
     @db the db to connect, should be defined in devops settings
     """
     def __init__(self, db_file, timeout=30, logger=None):
@@ -99,10 +103,7 @@ class DBBroker(object):
         return self.db_file
 
     def __enter__(self):
-        try:
-            self.initialize()
-        except DBAlreadyExists:
-            pass
+        self.initialize()
         return self
 
     def __exit__(self, exc_t, exc_v, tb):
@@ -124,6 +125,40 @@ class DBBroker(object):
         conn = sqlite3.connect(tmp_db_file, 
                                check_same_thread=False,
                                timeout=0)
+        self._initialize(conn)
+        conn.commit()
+        if tmp_db_file: 
+            conn.close()
+            if not os.path.exists(self.db_file):
+                with open(tmp_db_file, 'r+b') as f:
+                    os.fsync(f.fileno())
+                os.rename(tmp_db_file, self.db_file)
+            else:
+                os.remove(tmp_db_file)
+            self.conn = get_db_connection(self.db_file, self.timeout)
+        else:
+            self.conn = conn
+
+    def is_table_existing(self, table):
+        query = '''
+        SELECT name FROM sqlite_master WHERE type='table' AND name = '%s'
+        ''' % table
+        return True if self.execute_sql(query).fetchone() else False
+
+class AuthBroker(DBBroker):
+    """
+    AuthBroker is used for authentication table. It is derived from DBBroker.
+    """
+    db_type = 'auth'
+
+    def _initialize(self, conn):
+        self.create_auth_table(conn)
+    
+    def create_auth_table(self, conn):
+        """
+        Create the auth table for authentication
+        @conn: DB connection object
+        """
         sql = '''
         CREATE TABLE auth
         (id INTEGER primary key AUTOINCREMENT,
@@ -132,47 +167,32 @@ class DBBroker(object):
         expires INTEGER)
         '''
         conn.cursor().execute(sql)
-        conn.commit()
-        if tmp_db_file:
-            conn.close()
-            with open(tmp_db_file, 'r+b') as f:
-                os.fsync(f.fileno())
-            if not os.path.exists(self.db_file):
-                os.rename(tmp_db_file, self.db_file)
-            else:
-                os.remove(tmp_db_file)
-            self.conn = get_db_connection(self.db_file, self.timeout)
-        else:
-            self.conn = conn
 
-    def is_table_exist(self, table):
-        if table and len(table) > 0:
-            query = '''
-            SELECT name FROM sqlite_master WHERE type='table' AND name = '%s'
-            ''' % table
-            return True if self.execute_sql(query).fetchone() else False
-        else:
-            raise Exception("table None or table name is null")
+class MaintenanceEventBroker(DBBroker):
+    """
+    MaintenanceEventBroker is used for maintenance notfication event table
+    manifections. It is derived from DBBroker to reuse low levle functions.
+    """
+    db_type = 'maintenance_event'
 
-class MaintenanceSecheduler(DBBroker):
-    """
-    MaintenanceSecheduler is used for maintenance notfication event table
-    manifections. It is derived from Sqlite3Conn to reuse the lowlevle
-    functions
-    """
-    def __init__(self, service_list, when, duaration):
-        create_table = '''
-        CREATE TABLE maintenance_scheduler
-        (id INTEGER PRIMARY KEY AUTOINCREMENT, service text, when Date, duration INTEGER)
+    def _initialize(self, conn):
+        self.create_maintenance_event_table(conn)
+
+    def create_maintenance_event_table(self, conn):
+        sql = '''
+        CREATE TABLE maintenance_event
+        (id INTEGER PRIMARY KEY AUTOINCREMENT, 
+        service text, 
+        when Date, 
+        duration INTEGER)
         '''
-        self.execute_sql(create_table)
-        self.commit()
+        conn.cursor().execute(sql)
 
     def create_event(self, services, when, duration):
-        pass
+        pass #TODO
 
     def get_event(self, id):
-        pass
+        pass #TODO
 
 class SimpleAuth(object):
     """
@@ -185,32 +205,35 @@ class SimpleAuth(object):
     def __init__(self, algorithm='md5', expires=86400):
         super(SimpleAuth, self).__init__()
         self.db_file = '/Users/lafengnan/codes/Github/maintenance/nf.db' # for test, will get from settings
-        self.table = 'auth'
         self.token_life = expires
-        self.db = DBBroker(self.db_file)
-        self.db.initialize()
+        self._get_broker = lambda : AuthBroker(self.db_file)
         self.hash = getattr(hashlib, algorithm.lower(), hashlib.md5)
 
     def get_token(self, user, passwd):
         def _validate_user_and_passwd():
-            pass
-        _validate_user_and_passwd()
+            pass #TODO
+        
+        try:
+            _validate_user_and_passwd()
+        except Exception:
+            raise
 
         m = self.hash()
         m.update(user + passwd + \
                  datetime.now().strftime('%d/%m/%y: %H:%M:%S'))
         token  = m.hexdigest()
         expires = long(time() + self.token_life)
-
+        broker = self._get_broker()
+        broker.initialize()
         def _write_to_db(token, expires):
             update = '''
-            (SELECT id from %s WHERE user = '%s')
-            ''' % (self.table, user)
+            (SELECT id from auth WHERE user = '%s')
+            ''' % user
             sql = '''
-            INSERT or REPLACE INTO %s VALUES(%s, '%s', '%s', %d)
-            ''' % (self.table, update, user, token, expires)
-            self.db.execute_sql(sql)
-            self.db.commit()
+            INSERT or REPLACE INTO auth VALUES(%s, '%s', '%s', %d)
+            ''' % (update, user, token, expires)
+            broker.execute_sql(sql)
+            broker.commit()
 
         _write_to_db(token, expires)
 
@@ -219,12 +242,18 @@ class SimpleAuth(object):
     def validate_token(self, token):
         def _get_token_info_from_db(token):
             q = '''
-            SELECT token, expires from %s WHERE token = '%s'
-            ''' % (self.table, token)
-            r = self.db.execute_sql(q).fetchone()
+            SELECT token, expires from auth WHERE token = '%s'
+            ''' % token
+            r = broker.execute_sql(q).fetchone()
             if r:
                 return r
             raise Exception("token: %s is invalid" % token)
+
+        broker = self._get_broker()
+
+        if not os.path.exists(self.db_file):
+            raise Exception("%s is not existing!!!" % self.db_file)
+        broker.initialize()
         try:
             _, e = _get_token_info_from_db(token)
             return e - long(time()) > 0
