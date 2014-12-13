@@ -47,11 +47,17 @@ def get_token(auth, u, p, algorithm='md5'):
     return auth.get_token(u, p)
 
 if __name__ == '__main__':
-    main()
+    #main()
     auth = utils.SimpleAuth()
     print get_token(auth, 'devops', 'Passw0rd')
     print get_token(auth, 'devops2', 'Passw0rd')
+    print get_token(auth, 'devops3', 'Passw0rd')
+    print get_token(auth, 'devops4', 'Passw0rd')
+    print get_token(auth, 'devops5', 'Passw0rd')
     t = get_token(auth, 'devops', 'Passw0rd')
-    sleep(2)
     print t
-    print auth.validate_token(t)
+    try:
+        print auth.validate_token(t)
+        print auth.validate_token('123')
+    except utils.InvalidTokenError as e:
+        print e
