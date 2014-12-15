@@ -365,6 +365,10 @@ class MaintenanceEventBroker(DBBroker):
 
 
 class MaintenanceScheduler(object):
+    """
+    MaintenanceScheduler is the delegate for maintenance event operations.
+    The actual operations are performed by MaintenanceEventBroker.
+    """
     def __init__(self):
         super(MaintenanceScheduler, self).__init__()
         db_file = Config.get_config().maintenance_event_db
