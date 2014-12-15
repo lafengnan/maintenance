@@ -36,11 +36,11 @@ class DBAlreadyExists(sqlite3.DatabaseError):
         return 'DB %s already exists' % self.path
 
 class InvalidIDError(Exception):
-            def __init__(self, e_id):
-                self.id = e_id
+    def __init__(self, e_id):
+        self.id = e_id
 
-            def __str__(self):
-                return "Invalid id: %d" % self.id
+    def __str__(self):
+        return "Invalid id: %d" % self.id
 
 class AuthError(Exception):
     def __init__(self, user, token):
