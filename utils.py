@@ -36,8 +36,8 @@ class DBAlreadyExists(sqlite3.DatabaseError):
         return 'DB %s already exists' % self.path
 
 class InvalidIDError(Exception):
-            def __init__(self, id):
-                self.id = id
+            def __init__(self, e_id):
+                self.id = e_id
 
             def __str__(self):
                 return "Invalid id: %d" % self.id
@@ -334,10 +334,12 @@ class MaintenanceEventBroker(DBBroker):
         self.execute_sql(sql)
         self.commit()
 
-    def get_record(self, id):
+    def get_record(self, e_id):
         query = '''
         SELECT * FROM maintenance_event WHERE id = %d
-        ''' % id
+        ''' % e_id if e_id >= 0 else '''
+        SELECT * FROM maintenance_event ORDER BY id DESC LIMIT 1
+        '''
         return self.execute_sql(query).fetchone()
 
     def get_max_id(self):
@@ -347,10 +349,10 @@ class MaintenanceEventBroker(DBBroker):
         r = self.execute_sql(query).fetchone()
         return r['id'] if r else None
 
-    def update_record(self, id, service_lst, when, duration):
+    def update_record(self, e_id, service_lst, when, duration):
         update = '''
         (SELECT * FROM maintenance_event WHERE id = %d)
-        ''' % id
+        ''' % e_id
         sql = '''
         INSERT OR REPLACE INTO maintenance_event VALUES
         (%s, '%s', '%s', %d)
@@ -382,27 +384,27 @@ class MaintenanceScheduler(object):
         finally:
             return broker.get_max_id()
 
-    def get_event(self, id):
+    def get_event(self, e_id):
         broker = self._get_broker()
         try:
             with broker.broker as broker:
-                r = broker.get_record(id)
+                r = broker.get_record(e_id)
                 if r:
                     return r
                 else:
-                    raise InvalidIDError(id)
+                    raise InvalidIDError(e_id)
         except DBConnectionError:
             raise
 
-    def update_event(self, id, service_lst, when, duration):
+    def update_event(self, e_id, service_lst, when, duration):
         broker = self._get_broker()
         try:
-            broker.update_record(id, service_lst, when, duration)
-            return id
+            broker.update_record(e_id, service_lst, when, duration)
+            return e_id
         except Exception:
             raise
 
-    def delete_event(self, id):
+    def delete_event(self, e_id):
         pass #TODO
 
 class SimpleAuth(object):
