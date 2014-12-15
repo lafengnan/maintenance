@@ -186,6 +186,8 @@ class DBBroker(object):
     DBBroker is top broker class of sqlite3 connection, it should not
     be used directly. Any new table to create, please inherit it for usage.
     @db_file: the db file to connect, should be defined in devops settings.
+    @timeout: the timeout value to connect a db file
+    @logger: the logger for logging
     """
     def __init__(self, db_file, timeout=30, logger=None):
         super(DBBroker, self).__init__()
