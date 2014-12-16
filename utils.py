@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # coding=utf-8
 
 import os
@@ -10,9 +9,12 @@ from time import time
 from datetime import datetime
 from contextlib import contextmanager
 
+import shutil
 import logging
 import ConfigParser
 from tempfile import mkstemp
+
+from simplecrypt import encrypt, decrypt
 
 LOGGING_FORMAT = '%(asctime)s %(levelname)s user_id:%(user_id)s %(message)s'
 SYSLOG_LOGGING_FORMAT = '%(levelname)s user_id:%(user_id)s %(message)s'
@@ -41,6 +43,20 @@ class InvalidIDError(Exception):
 
     def __str__(self):
         return "Invalid id: %d" % self.id
+
+class InvalidUserError(Exception):
+    def __init__(self, user):
+        self.user = user
+
+    def __str__(self):
+        return "Invalid user: %s" % self.user
+
+class InvalidPasswdError(Exception):
+    def __init__(self, passwd):
+        self.passwd = passwd
+
+    def __str__(self):
+        return "Wrong password: %s" % self.passwd
 
 class AuthError(Exception):
     def __init__(self, user, token):
@@ -93,9 +109,11 @@ class Cache(object):
 
     @classmethod
     def dump(cls):
-        #TODO
-        for k, v in cls.cache.items():
-            print k, ": ", v
+        import csv
+        with open("/tmp/token_cache.csv", 'w') as f:
+            w = csv.writer(f)
+            for k, v in cls.cache.items():
+                w.writerow([k, v])
 
 class Config(object):
     """
@@ -105,24 +123,36 @@ class Config(object):
         [devops]
         user = devops
         passwd = passwd
+        encrypt_flag = False
 
         [security]
         algorithm = md5
         expires = 86400
 
         [database]
-        auth = /var/polaris/auth.db
-        event = /var/polaris/maintenance.db
+        auth_db = /var/polaris/auth.db
+        event_db = /var/polaris/maintenance.db
+
+    The option 'encrypt_flag' should be pre-defined as False for encryption
+    invoking later.
 
     """
     def __init__(self, conf_file='/etc/polaris/maintenance.cfg'):
         self.conf_file = conf_file
         self.config = ConfigParser.RawConfigParser(allow_no_value=True)
         self.config.read(conf_file)
+        if not self.config.getboolean('devops', 'encrypt_flag'):
+            self._encrypt_password()
 
     @staticmethod
     def get_config():
         return Config(CONF_PATH)
+
+    def _encrypt_password(self):
+        cipher_passwd = encrypt('devops', self.config.get('devops', 'passwd'))
+        self.config.set('devops', 'passwd', cipher_passwd)
+        self.config.set('devops', 'encrypt_flag', True)
+        self.config.write(open(self.conf_file, 'w'))
 
     @property
     def user(self):
@@ -142,11 +172,11 @@ class Config(object):
 
     @property
     def auth_db(self):
-        return self.config.get('database', 'auth')
+        return self.config.get('database', 'auth_db')
 
     @property
     def maintenance_event_db(self):
-        return self.config.get('database', 'event')
+        return self.config.get('database', 'event_db')
 
 def mkdirs(path):
     if not os.path.isdir(path):
@@ -214,6 +244,9 @@ class DBBroker(object):
     def commit(self):
         self.conn.commit()
 
+    def rollback(self):
+        self.conn.rollback()
+
     def is_table_existing(self, table):
         query = '''
         SELECT name FROM sqlite_master WHERE type='table' AND name = '%s'
@@ -263,11 +296,19 @@ class DBBroker(object):
         finally:
             self.conn.close()
 
-    def backup(self, dst_path):
-        pass #TODO
+    def backup(self, backup_dir):
+        if not os.path.exists(backup_dir):
+            raise Exception("Backup dir does not exist!" % backup_dir)
+        backup_db_file = os.path.join(
+            backup_dir,
+            os.path.basename(self.db_file)
+            + datetime.now().strftime(".%Y%m%d-%H:%M:%S"))
+        self.execute_sql('BEGIN IMMEDIATE')
+        shutil.copyfile(self.db_file, backup_db_file)
+        self.rollback()
 
-    def restore(self, src_path):
-        pass #TODO
+    def restore(self, src_db_file):
+        raise NotImplementedError
 
 class AuthBroker(DBBroker):
     """
@@ -293,10 +334,30 @@ class AuthBroker(DBBroker):
         '''
         conn.cursor().execute(sql)
 
+    def add_token(self, user, token, expires):
+        update = '''
+        (SELECT id FROM auth WHERE user = '%s')
+        ''' % user
+        sql = '''
+        INSERT OR REPLACE INTO auth VALUES(%s, '%s', '%s', %d)
+        ''' % (update, user, token, expires)
+        self.execute_sql(sql)
+        self.commit()
+
+    def get_token_info(self, token):
+        q = '''
+        SELECT user, token, expires FROM auth WHERE token = '%s'
+        ''' % token
+        # If token is valid, return(token, expires)
+        # If token is invalid, return None
+        return self.execute_sql(q).fetchone()
+
+
 class MaintenanceEventBroker(DBBroker):
     """
     MaintenanceEventBroker is used for maintenance notfication event table
-    manifections. It is derived from DBBroker to reuse low levle functions.
+    manifections. It is derived from DBBroker to reuse low level functions.
+    @conn: the connection to db file
     """
     db_type = 'maintenance_event'
 
@@ -304,16 +365,6 @@ class MaintenanceEventBroker(DBBroker):
         self.create_maintenance_event_table(conn)
 
     def create_maintenance_event_table(self, conn):
-        sql = '''
-        CREATE TABLE maintenance_event
-        (id INTEGER PRIMARY KEY AUTOINCREMENT,
-        service TEXT,
-        timestamp TEXT,
-        duration INTEGER)
-        '''
-        conn.cursor().execute(sql)
-
-    def add_record(self, service_lst, when, duration):
         """
         SQLite does not have a storage class set aside for storing dates
         and/or times. Instead, the built-in Date And Time Functions of
@@ -330,6 +381,16 @@ class MaintenanceEventBroker(DBBroker):
         """
 
         sql = '''
+        CREATE TABLE maintenance_event
+        (id INTEGER PRIMARY KEY AUTOINCREMENT,
+        service TEXT,
+        timestamp TEXT,
+        duration INTEGER)
+        '''
+        conn.cursor().execute(sql)
+
+    def add_record(self, service_lst, when, duration):
+        sql = '''
         INSERT INTO maintenance_event VALUES
         (NULL, '%s', '%s', %d)
         ''' % (service_lst, when, duration)
@@ -337,14 +398,26 @@ class MaintenanceEventBroker(DBBroker):
         self.commit()
 
     def get_record(self, e_id):
+        """
+        In order to retrieve the latest event, we plan to use negative value to
+        get the latest event record. Hence the query has relationship with e_id.
+        """
         query = '''
         SELECT * FROM maintenance_event WHERE id = %d
         ''' % e_id if e_id >= 0 else '''
-        SELECT * FROM maintenance_event ORDER BY id DESC LIMIT 1
+        SELECT * FROM maintenance_event ORDER BY timestamp DESC LIMIT 1
         '''
         return self.execute_sql(query).fetchone()
 
-    def get_max_id(self):
+    @property
+    def all_records(self):
+        query = '''
+        SELECT * FROM maintenance_event
+        '''
+        return self.execute_sql(query).fetchall()
+
+    @property
+    def max_id(self):
         query = '''
         SELECT MAX(id) as id FROM maintenance_event
         '''
@@ -361,6 +434,18 @@ class MaintenanceEventBroker(DBBroker):
         ''' % (update, service_lst, when, duration)
         try:
             self.execute_sql(sql)
+            self.commit()
+        except (sqlite3.DataError, sqlite3.DatabaseError):
+            raise
+
+    def delete_record(self, e_id):
+        query = '''
+        DELETE FROM maintenance_event WHERE id = %d
+        ''' % e_id if isinstance(e_id, int) else '''
+        DELETE FROM maintenance_event
+        '''
+        try:
+            self.execute_sql(query)
             self.commit()
         except (sqlite3.DataError, sqlite3.DatabaseError):
             raise
@@ -388,19 +473,28 @@ class MaintenanceScheduler(object):
         except DBConnectionError:
             broker.add_record(services, when, duration)
         finally:
-            return broker.get_max_id()
+            return broker.max_id
 
-    def get_event(self, e_id):
+    def get_event(self, e_id=-1):
         broker = self._get_broker()
-        try:
-            with broker.broker as broker:
-                r = broker.get_record(e_id)
-                if r:
-                    return r
-                else:
-                    raise InvalidIDError(e_id)
-        except DBConnectionError:
-            raise
+        if isinstance(e_id, int):
+            try:
+                with broker.broker as broker:
+                    r = broker.get_record(e_id)
+                    if r:
+                        return r
+                    else:
+                        raise InvalidIDError(e_id)
+            except DBConnectionError:
+                raise
+        elif isinstance(e_id, str) and e_id.lower() == 'all':
+            try:
+                with broker.broker as broker:
+                    return broker.all_records
+            except DBConnectionError:
+                raise
+        else:
+            raise InvalidIDError(e_id)
 
     def update_event(self, e_id, service_lst, when, duration):
         broker = self._get_broker()
@@ -411,7 +505,24 @@ class MaintenanceScheduler(object):
             raise
 
     def delete_event(self, e_id):
-        pass #TODO
+        if isinstance(e_id, str) and e_id != 'all':
+            raise InvalidIDError(e_id)
+        broker = self._get_broker()
+        try:
+            with broker.broker as broker:
+                broker.delete_record(e_id)
+        except DBConnectionError:
+            raise
+
+    def backup_db(self, backup_dir):
+        with self._get_broker().broker as broker:
+            try:
+                broker.backup(backup_dir)
+            except Exception:
+                raise
+
+    def restore(self, src_db_file):
+        raise NotImplementedError
 
 class SimpleAuth(object):
     """
@@ -439,11 +550,13 @@ class SimpleAuth(object):
         def _validate_user_and_passwd():
             u = Config.get_config().user
             p = Config.get_config().passwd
-            if u != user or p != passwd:
-                raise Exception("Invalid (user: %s, passwd: %s)" % (user, passwd))
+            if user != u:
+                raise InvalidUserError(user)
+            elif passwd != decrypt('devops', p):
+                raise InvalidPasswdError(passwd)
         try:
             _validate_user_and_passwd()
-        except Exception:
+        except (InvalidUserError, InvalidPasswdError):
             raise
 
         m = self.hash()
@@ -452,38 +565,20 @@ class SimpleAuth(object):
         token  = m.hexdigest()
         expires = long(time() + self.token_life)
         broker = self._get_broker()
-        def _write_to_db():
-            update = '''
-            (SELECT id FROM auth WHERE user = '%s')
-            ''' % user
-            sql = '''
-            INSERT OR REPLACE INTO auth VALUES(%s, '%s', '%s', %d)
-            ''' % (update, user, token, expires)
-            broker.execute_sql(sql)
-            broker.commit()
-
         try:
             with broker.broker as broker:
-                _write_to_db()
+                broker.add_token(user, token, expires)
         except DBConnectionError: # DB does not exist
             broker.initialize()
-            _write_to_db()
+            broker.add_token(user, token, expires)
 
         return token
 
     def validate_token(self, token):
-        def _get_token_info_from_db():
-            q = '''
-            SELECT user, token, expires FROM auth WHERE token = '%s'
-            ''' % token
-            # If token is valid, return(token, expires)
-            # If token is invalid, return None
-            return broker.execute_sql(q).fetchone()
-
         broker = self._get_broker()
         try:
             with broker.broker as broker:
-                info = _get_token_info_from_db()
+                info = broker.get_token_info(token)
                 if not info:
                     raise InvalidTokenError(None, token)
                 elif info['expires'] - long(time()) <= 0:
@@ -494,3 +589,13 @@ class SimpleAuth(object):
                     return "valid"
         except DBConnectionError:
             raise
+
+    def backup_db(self, backup_dir):
+        with self._get_broker().broker as broker:
+            try:
+                broker.backup(backup_dir)
+            except Exception:
+                raise
+
+    def restore(self, src_db_file):
+        raise NotImplementedError
