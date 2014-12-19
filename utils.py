@@ -4,9 +4,11 @@ import os
 import errno
 import hashlib
 import sqlite3
+import dateutil
 import functools
 from time import time
 from datetime import datetime
+from collections import OrderedDict
 from contextlib import contextmanager
 
 import shutil
@@ -123,7 +125,7 @@ class Config(object):
         [devops]
         user = devops
         passwd = passwd
-        encrypt_flag = False
+        encrypted_flag = False
 
         [security]
         algorithm = md5
@@ -133,15 +135,16 @@ class Config(object):
         auth_db = /var/polaris/auth.db
         event_db = /var/polaris/maintenance.db
 
-    The option 'encrypt_flag' should be pre-defined as False for encryption
+    The option 'encrypted_flag' should be pre-defined as False for encryption
     invoking later.
 
     """
     def __init__(self, conf_file='/etc/polaris/maintenance.cfg'):
+        super(Config, self).__init__()
         self.conf_file = conf_file
         self.config = ConfigParser.RawConfigParser(allow_no_value=True)
         self.config.read(conf_file)
-        if not self.config.getboolean('devops', 'encrypt_flag'):
+        if not self.config.getboolean('devops', 'encrypted_flag'):
             self._encrypt_password()
 
     @staticmethod
@@ -151,7 +154,7 @@ class Config(object):
     def _encrypt_password(self):
         cipher_passwd = encrypt('devops', self.config.get('devops', 'passwd'))
         self.config.set('devops', 'passwd', cipher_passwd)
-        self.config.set('devops', 'encrypt_flag', True)
+        self.config.set('devops', 'encrypted_flag', True)
         self.config.write(open(self.conf_file, 'w'))
 
     @property
@@ -257,25 +260,28 @@ class DBBroker(object):
         """
         Create the database
         """
-        mkdirs(self.db_dir)
-        fd, tmp_db_file = mkstemp(suffix='.tmp', dir=self.db_dir)
-        os.close(fd)
-        conn = sqlite3.connect(tmp_db_file,
-                               check_same_thread=False,
-                               timeout=0)
-        self._initialize(conn)
-        conn.commit()
-        if tmp_db_file:
-            conn.close()
-            if not os.path.exists(self.db_file):
-                with open(tmp_db_file, 'r+b') as f:
-                    os.fsync(f.fileno())
-                os.rename(tmp_db_file, self.db_file)
-            else:
-                os.remove(tmp_db_file)
+        if os.path.exists(self.db_file):
             self.conn = get_db_connection(self.db_file, self.timeout)
         else:
-            self.conn = conn
+            mkdirs(self.db_dir)
+            fd, tmp_db_file = mkstemp(suffix='.tmp', dir=self.db_dir)
+            os.close(fd)
+            conn = sqlite3.connect(tmp_db_file,
+                                   check_same_thread=False,
+                                   timeout=0)
+            self._initialize(conn)
+            conn.commit()
+            if tmp_db_file:
+                conn.close()
+                if not os.path.exists(self.db_file):
+                    with open(tmp_db_file, 'r+b') as f:
+                        os.fsync(f.fileno())
+                        os.rename(tmp_db_file, self.db_file)
+                else:
+                    os.remove(tmp_db_file)
+                    self.conn = get_db_connection(self.db_file, self.timeout)
+            else:
+                self.conn = conn
 
     @property
     @contextmanager
@@ -348,10 +354,9 @@ class AuthBroker(DBBroker):
         q = '''
         SELECT user, token, expires FROM auth WHERE token = '%s'
         ''' % token
-        # If token is valid, return(token, expires)
+        # If token is valid, return(user, token, expires)
         # If token is invalid, return None
         return self.execute_sql(q).fetchone()
-
 
 class MaintenanceEventBroker(DBBroker):
     """
@@ -379,35 +384,64 @@ class MaintenanceEventBroker(DBBroker):
         In Polaris-* services, the date format is ISO8601, so we would like to
         use TEXT as the date type.
         """
-
         sql = '''
         CREATE TABLE maintenance_event
         (id INTEGER PRIMARY KEY AUTOINCREMENT,
-        service TEXT,
+        services TEXT,
         timestamp TEXT,
-        duration INTEGER)
+        duration INTEGER,
+        state TEXT)
         '''
         conn.cursor().execute(sql)
 
-    def add_record(self, service_lst, when, duration):
+    def add_record(self, service_lst, when, duration, state='plan'):
         sql = '''
         INSERT INTO maintenance_event VALUES
-        (NULL, '%s', '%s', %d)
-        ''' % (service_lst, when, duration)
+        (NULL, '%s', '%s', %d, '%s')
+        ''' % (service_lst, when, duration, state)
         self.execute_sql(sql)
         self.commit()
 
-    def get_record(self, e_id):
+    def get_record(self, e_id, state='plan'):
         """
-        In order to retrieve the latest event, we plan to use negative value to
-        get the latest event record. Hence the query has relationship with e_id.
+        In order to retrieve the latest event, we plan to use negative VALUES
+        to get the latest event record. Hence the query has relationship with
+        e_id. timestamp follows ISO8601 format, can be either one of below:
+            1. YYYY-MM-DD
+            2. YYYY-MM-DD HH:MM
+            3. YYYY-MM-DD HH:MM:SS
+            4. YYYY-MM-DD HH:MM:SS.SSS
+            5. YYYY-MM-DDTHH:MM
+            6. YYYY-MM-DDTHH:MM:SS
+            7. YYYY-MM-DDTHH:MM:SS.SSS
+            8. HH:MM
+            9. HH:MM:SS
+            10. HH:MM:SS.SSS
+            11. now
+            12. DDDDDDDDDD
+        Formats 2 through 10 may be optionally followed by a timezone indicator
+        of the form "[+-]HH:MM" or just "Z". The date and time functions use
+        UTC or "zulu" time internally, and so the "Z" suffix is a no-op. Any
+        non-zero "HH:MM" suffix is subtracted from the indicated date and time
+        in order to compute zulu time. For example, all of the following time
+        strings are equivalent:
+            1. 2013-10-07 08:23:19.120
+            2. 2013-10-07T08:23:19.120Z
+            3. 2013-10-07 04:23:19.120-04:00
+            4. 2456572.84952685
+        The date function: datetime(timestamp) will get a UTC time as a default
+        time value with strftime('%Y-%m-%d %H:%M:%S', ...). Conesequently, the
+        application needs to return a UTC time for time comparation and an
+        original timestamp for notification display.
         """
-        query = '''
-        SELECT * FROM maintenance_event WHERE id = %d
-        ''' % e_id if e_id >= 0 else '''
-        SELECT * FROM maintenance_event ORDER BY timestamp DESC LIMIT 1
-        '''
-        return self.execute_sql(query).fetchone()
+        query = '''SELECT id, services, datetime(timestamp) as timestamp,
+        duration, state FROM maintenance_event WHERE id = %d''' % e_id \
+        if isinstance(e_id, int) and e_id >= 0 else \
+        '''SELECT id, services, datetime(timestamp) as timestamp, duration,
+        state FROM maintenance_event WHERE
+        strftime('%%s',timestamp,'utc') - strftime('%%s','now','utc') <= 86400
+        AND state = '%s' ORDER BY datetime(timestamp) ASC''' % state
+        return self.execute_sql(query).fetchall()
 
     @property
     def all_records(self):
@@ -424,32 +458,30 @@ class MaintenanceEventBroker(DBBroker):
         r = self.execute_sql(query).fetchone()
         return r['id'] if r else None
 
-    def update_record(self, e_id, service_lst, when, duration):
-        update = '''
-        (SELECT * FROM maintenance_event WHERE id = %d)
-        ''' % e_id
-        sql = '''
-        INSERT OR REPLACE INTO maintenance_event VALUES
-        (%s, '%s', '%s', %d)
-        ''' % (update, service_lst, when, duration)
+    def update_record(self, e_id, services=None,
+                      when=None, duration=None, state=None):
+        update = '''UPDATE maintenance_event SET '''
+        update += '''timestamp = '%s', ''' % when if when else str()
+        update += '''duration = %d, ''' % duration if duration else str()
+        update += '''state = '%s' ''' % state if state else str()
+        update = update[:-2] + ''' WHERE id = %d''' % e_id
         try:
-            self.execute_sql(sql)
+            print update
+            self.execute_sql(update)
             self.commit()
         except (sqlite3.DataError, sqlite3.DatabaseError):
             raise
 
     def delete_record(self, e_id):
-        query = '''
-        DELETE FROM maintenance_event WHERE id = %d
-        ''' % e_id if isinstance(e_id, int) else '''
-        DELETE FROM maintenance_event
-        '''
+        if not isinstance(e_id, int) and e_id != 'all':
+            raise InvalidIDError(e_id)
+        query = '''DELETE FROM maintenance_event WHERE id = %d''' % e_id \
+            if isinstance(e_id, int) else '''DELETE FROM maintenance_event'''
         try:
             self.execute_sql(query)
             self.commit()
         except (sqlite3.DataError, sqlite3.DatabaseError):
             raise
-
 
 class MaintenanceScheduler(object):
     """
@@ -469,22 +501,20 @@ class MaintenanceScheduler(object):
         broker = self._get_broker()
         broker.initialize()
         try:
-            broker.add_record(services, when, duration)
+            with broker.broker as broker:
+                broker.add_record(services, when, duration)
+                return broker.max_id
         except DBConnectionError:
-            broker.add_record(services, when, duration)
-        finally:
-            return broker.max_id
+            raise
 
     def get_event(self, e_id=-1):
         broker = self._get_broker()
         if isinstance(e_id, int):
             try:
                 with broker.broker as broker:
-                    r = broker.get_record(e_id)
-                    if r:
-                        return r
-                    else:
+                    if e_id < -1 or e_id > broker.max_id:
                         raise InvalidIDError(e_id)
+                    return broker.get_record(e_id)
             except DBConnectionError:
                 raise
         elif isinstance(e_id, str) and e_id.lower() == 'all':
@@ -496,10 +526,12 @@ class MaintenanceScheduler(object):
         else:
             raise InvalidIDError(e_id)
 
-    def update_event(self, e_id, service_lst, when, duration):
+    def update_event(self, e_id, services=None,
+                     when=None, duration=None, state=None):
         broker = self._get_broker()
         try:
-            broker.update_record(e_id, service_lst, when, duration)
+            with broker.broker as broker:
+                broker.update_record(e_id, services, when, duration)
             return e_id
         except Exception:
             raise
@@ -513,6 +545,39 @@ class MaintenanceScheduler(object):
                 broker.delete_record(e_id)
         except DBConnectionError:
             raise
+
+    def convert_events_to_dict(self, events):
+        """
+        events is a list consit of sqlite3.Row object. We need to convert
+        it to a ordered dict, which is ordered by timestamp asc. For example:
+            events = [
+            (7, 'storage, Cassandra', '2014-12-18 11:59:00.000', 120, 'plan'),
+            (8, 'storage, Cassandra', '2014-12-19 09:07:00.000', 120, 'plan')
+            ]
+
+            The converted events should looks like below:
+                {'7': {
+                         'services': ['storage', 'Cassandra'],
+                         'timestamp': '2014-12-18 11:59:00',
+                         'duration': 120,
+                         'state': 'plan'
+                       },
+                 '8': {
+                         'services': ['storage", 'Cassandra'],
+                         'timestamp': '2014-12-19 09:07:00',
+                         'duration': 120,
+                         'state': 'plan'
+                       }
+                }
+        """
+        if events:
+            d = OrderedDict()
+            for e in events:
+                d.update({e[k]:{k:e[k] for k in e.keys() if k != 'id'}
+                          for k in e.keys() if k == 'id'})
+            for k in d.keys():
+                d[k]['services'] = d[k]['services'].split(', ')
+            return d
 
     def backup_db(self, backup_dir):
         with self._get_broker().broker as broker:
@@ -599,3 +664,24 @@ class SimpleAuth(object):
 
     def restore(self, src_db_file):
         raise NotImplementedError
+
+def from_iso8601(s):
+    """
+    Parses a tz-aware date from iso 8601. Assumes UTC if no time zone is provided, returns in UTC tz.
+    >>> from_iso8601("2012-08-05T15:00:00Z")
+    datetime.datetime(2012, 8, 5, 15, 0, tzinfo=tzutc())
+    >>> from_iso8601("2012-08-05T20:00:00+0430")
+    datetime.datetime(2012, 8, 5, 15, 30, tzinfo=tzutc())
+    >>> from_iso8601("2012-08-09")
+    datetime.datetime(2012, 8, 9, 0, 0, tzinfo=tzutc())
+    >>> from_iso8601("2012-08-09T20:00:00.7952821Z")
+    datetime.datetime(2012, 8, 9, 20, 0, 0, 795282, tzinfo=tzutc())
+    >>> from_iso8601("i am not a date")
+    Traceback (most recent call last):
+      ...
+    ValueError: unknown string format
+    """
+    d = dateutil.parser.parse(s, yearfirst=True, dayfirst=False, fuzzy=False)
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=dateutil.tz.tzutc())
+    return d.astimezone(dateutil.tz.tzutc())
