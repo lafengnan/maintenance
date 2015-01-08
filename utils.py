@@ -4,6 +4,7 @@ import os
 import errno
 import hashlib
 import sqlite3
+import sqlitebck
 import dateutil
 import functools
 from time import time
@@ -20,7 +21,6 @@ from simplecrypt import encrypt, decrypt
 
 LOGGING_FORMAT = '%(asctime)s %(levelname)s user_id:%(user_id)s %(message)s'
 SYSLOG_LOGGING_FORMAT = '%(levelname)s user_id:%(user_id)s %(message)s'
-CONF_PATH = '/etc/polaris/maintenance.cfg'
 
 class DBConnectionError(sqlite3.DatabaseError):
     def __init__(self, path, msg, timeout=0):
@@ -44,7 +44,7 @@ class InvalidIDError(Exception):
         self.id = e_id
 
     def __str__(self):
-        return "Invalid id: %d" % self.id
+        return "Invalid id: {id}".format(id=self.id)
 
 class InvalidUserError(Exception):
     def __init__(self, user):
@@ -83,9 +83,9 @@ class Cache(object):
 
     def __call__(self, f):
         @functools.wraps(f)
-        def wrapper(inst, user, passwd):
-            if user not in Cache.cache:
-                Cache.cache[user] = f(inst, user, passwd)
+        def wrapper(inst, conf, user, passwd, *args, **kargs):
+            if user not in Cache.cache or passwd != conf.get('passwd'):
+                Cache.cache[user] = f(inst, conf, user, passwd, *args, **kargs)
             return Cache.cache.get(user)
         return wrapper
 
@@ -123,8 +123,8 @@ class Config(object):
     The configuration is defined by groups.
     One example below:
         [devops]
-        user = devops
-        passwd = passwd
+        user = <user name>
+        passwd = <passwd of user>
         encrypted_flag = False
 
         [security]
@@ -139,7 +139,7 @@ class Config(object):
     invoking later.
 
     """
-    def __init__(self, conf_file='/etc/polaris/maintenance.cfg'):
+    def __init__(self, conf_file='./maintenance.cfg'):
         super(Config, self).__init__()
         self.conf_file = conf_file
         self.config = ConfigParser.RawConfigParser(allow_no_value=True)
@@ -148,8 +148,8 @@ class Config(object):
             self._encrypt_password()
 
     @staticmethod
-    def get_config():
-        return Config(CONF_PATH)
+    def get_config(conf_path):
+        return Config(conf_path)
 
     def _encrypt_password(self):
         cipher_passwd = encrypt('devops', self.config.get('devops', 'passwd'))
@@ -189,7 +189,7 @@ def mkdirs(path):
             if e.errno != errno.EEXIST or not os.path.isdir(path):
                 raise
 
-def get_db_connection(path, timeout=30):
+def get_db_connection(path, timeout=30.0):
     """
     Return a Sqlite3 database connection
     @path: path to DB
@@ -214,6 +214,35 @@ def get_db_connection(path, timeout=30):
                                 traceback.format_exc(),
                                 timeout=timeout)
 
+def back_up_mem_to_file(mem_conn, backup_db_file, timeout=30.0):
+    '''
+    Not sure if the performance of file db is good or bad. Hence we may
+    need to support :memory: db for usage. After each update, sync it to
+    a db file on disk. If system is reboot or the system crashed, the db
+    file should be restored into memory for further usage.
+    @mem_conn: :memory: db connection
+    @backup_db_file: the db file for backup
+    @timeout: the timeout value for db connection
+    '''
+    backup_conn = get_db_connection(backup_db_file, timeout)
+    sqlitebck.copy(mem_conn, backup_conn)
+    mem_conn.close()
+
+def restore_file_db_to_mem(db_file, timeout=30):
+    '''
+    To restore the db_file into memory for high performance usage. If system
+    crashes or reboots, the db_file should be restored to memory for further
+    usage.
+    @db_file: the backuped db file
+    @timeout: the timeout value for db connection
+    '''
+    mem_conn = get_db_connection(':memory:',0)
+    try:
+        db_file_conn = get_db_connection(db_file, timeout)
+        sqlitebck.copy(db_file_conn, mem_conn)
+    except sqlite3.DatabaseError:
+        raise
+
 class DBBroker(object):
     """
     DBBroker is top broker class of sqlite3 connection, it should not
@@ -222,7 +251,7 @@ class DBBroker(object):
     @timeout: the timeout value to connect a db file
     @logger: the logger for logging
     """
-    def __init__(self, db_file, timeout=30, logger=None):
+    def __init__(self, db_file, timeout=30.0, logger=None):
         super(DBBroker, self).__init__()
         self.conn = None
         self.db_file = db_file
@@ -241,8 +270,10 @@ class DBBroker(object):
     def __exit__(self, exc_t, exc_v, tb):
         self.conn.close()
 
-    def execute_sql(self, query):
-        return self.conn.cursor().execute(query)
+    def execute_sql(self, query, *args):
+        msg = query + " ".join(args[0]) if args else query
+        self.logger.debug(msg)
+        return self.conn.cursor().execute(query, *args)
 
     def commit(self):
         self.conn.commit()
@@ -250,53 +281,56 @@ class DBBroker(object):
     def rollback(self):
         self.conn.rollback()
 
-    def is_table_existing(self, table):
+    def table_is_existing(self, table):
         query = '''
-        SELECT name FROM sqlite_master WHERE type='table' AND name = '%s'
-        ''' % table
-        return True if self.execute_sql(query).fetchone() else False
+        SELECT name FROM sqlite_master WHERE type='table' AND name = ?
+        '''
+        return True if self.execute_sql(query, (table, )).fetchone() else False
 
     def initialize(self):
         """
         Create the database
         """
-        if os.path.exists(self.db_file):
+        if self.db_file == ':memory:':
+            tmp_db_file = None
+            conn = get_db_connection(self.db_file, self.timeout)
+        else:
+            if os.path.exists(self.db_file):
+                tmp_db_file = None
+                conn = get_db_connection(self.db_file, self.timeout)
+            else:
+                mkdirs(self.db_dir)
+                fd, tmp_db_file = mkstemp(suffix='.tmp', dir=self.db_dir)
+                os.close(fd)
+                conn = sqlite3.connect(tmp_db_file,
+                                       check_same_thread=False,
+                                       timeout=self.timeout)
+        self._initialize(conn)
+        conn.commit()
+        if tmp_db_file:
+            conn.close()
+            with open(tmp_db_file, 'r+b') as f:
+                os.fsync(f.fileno())
+            if os.path.exists(self.db_file):
+                os.remove(tmp_db_file)
+            else:
+                os.rename(tmp_db_file, self.db_file)
             self.conn = get_db_connection(self.db_file, self.timeout)
         else:
-            mkdirs(self.db_dir)
-            fd, tmp_db_file = mkstemp(suffix='.tmp', dir=self.db_dir)
-            os.close(fd)
-            conn = sqlite3.connect(tmp_db_file,
-                                   check_same_thread=False,
-                                   timeout=0)
-            self._initialize(conn)
-            conn.commit()
-            if tmp_db_file:
-                conn.close()
-                if not os.path.exists(self.db_file):
-                    with open(tmp_db_file, 'r+b') as f:
-                        os.fsync(f.fileno())
-                        os.rename(tmp_db_file, self.db_file)
-                else:
-                    os.remove(tmp_db_file)
-                    self.conn = get_db_connection(self.db_file, self.timeout)
-            else:
-                self.conn = conn
+            self.conn = conn
 
-    @property
     @contextmanager
-    def broker(self):
+    def broker(self, tb_name=None):
         """
         Enable 'with...as' statement
         """
         if not self.conn:
-            if self.db_file != ':memory:' and os.path.exists(self.db_file):
-                try:
-                    self.conn = get_db_connection(self.db_file, self.timeout)
-                except (sqlite3.DatabaseError, DBConnectionError):
-                    raise
-            else:
-                raise DBConnectionError(self.db_file, "DB does not exist!")
+            try:
+                self.conn = get_db_connection(self.db_file, self.timeout)
+                if tb_name and not self.table_is_existing(tb_name):
+                    self.initialize()
+            except (sqlite3.DatabaseError, DBConnectionError):
+                raise
         try:
             yield self
         finally:
@@ -338,6 +372,7 @@ class AuthBroker(DBBroker):
         token TEXT,
         expires INTEGER)
         '''
+        self.logger.debug(sql)
         conn.cursor().execute(sql)
 
     def add_token(self, user, token, expires):
@@ -352,11 +387,11 @@ class AuthBroker(DBBroker):
 
     def get_token_info(self, token):
         q = '''
-        SELECT user, token, expires FROM auth WHERE token = '%s'
-        ''' % token
+        SELECT user, token, expires FROM auth WHERE token = ?
+        '''
         # If token is valid, return(user, token, expires)
         # If token is invalid, return None
-        return self.execute_sql(q).fetchone()
+        return self.execute_sql(q, (token, )).fetchone()
 
 class MaintenanceEventBroker(DBBroker):
     """
@@ -392,6 +427,7 @@ class MaintenanceEventBroker(DBBroker):
         duration INTEGER,
         state TEXT)
         '''
+        self.logger.debug(sql)
         conn.cursor().execute(sql)
 
     def add_record(self, service_lst, when, duration, state='plan'):
@@ -434,8 +470,7 @@ class MaintenanceEventBroker(DBBroker):
         application needs to return a UTC time for time comparation and an
         original timestamp for notification display.
         """
-        query = '''SELECT id, services, datetime(timestamp) as timestamp,
-        duration, state FROM maintenance_event WHERE id = %d''' % e_id \
+        query = '''SELECT * FROM maintenance_event WHERE id = %d''' % e_id \
         if isinstance(e_id, int) and e_id >= 0 else \
         '''SELECT id, services, datetime(timestamp) as timestamp, duration,
         state FROM maintenance_event WHERE
@@ -445,32 +480,31 @@ class MaintenanceEventBroker(DBBroker):
 
     @property
     def all_records(self):
-        query = '''
-        SELECT * FROM maintenance_event
-        '''
+        query = '''SELECT * FROM maintenance_event'''
         return self.execute_sql(query).fetchall()
 
     @property
     def max_id(self):
-        query = '''
-        SELECT MAX(id) as id FROM maintenance_event
-        '''
+        query = '''SELECT MAX(id) as id FROM maintenance_event'''
         r = self.execute_sql(query).fetchone()
         return r['id'] if r else None
 
     def update_record(self, e_id, services=None,
                       when=None, duration=None, state=None):
-        update = '''UPDATE maintenance_event SET '''
-        update += '''timestamp = '%s', ''' % when if when else str()
-        update += '''duration = %d, ''' % duration if duration else str()
-        update += '''state = '%s' ''' % state if state else str()
-        update = update[:-2] + ''' WHERE id = %d''' % e_id
-        try:
-            print update
-            self.execute_sql(update)
-            self.commit()
-        except (sqlite3.DataError, sqlite3.DatabaseError):
-            raise
+        if services or when or duration or state:
+            update = '''UPDATE maintenance_event SET '''
+            update += '''services = '%s', ''' % services if services else str()
+            update += '''timestamp = '%s', ''' % when if when else str()
+            update += '''duration = %d, ''' % duration if duration else str()
+            update += '''state = '%s' ''' % state if state else str()
+            update = update[:-1] + ''' WHERE id = %d''' % e_id \
+                if update[-2] != ','  \
+                else update[:-2] + ''' WHERE id = %d''' % e_id
+            try:
+                self.execute_sql(update)
+                self.commit()
+            except (sqlite3.DataError, sqlite3.DatabaseError):
+                raise
 
     def delete_record(self, e_id):
         if not isinstance(e_id, int) and e_id != 'all':
@@ -488,20 +522,24 @@ class MaintenanceScheduler(object):
     MaintenanceScheduler is the delegate for maintenance event operations.
     The actual operations are performed by MaintenanceEventBroker.
     """
-    def __init__(self):
+    def __init__(self, db_file, timeout, logger=None):
         super(MaintenanceScheduler, self).__init__()
-        db_file = Config.get_config().maintenance_event_db
-        self._get_broker = lambda : MaintenanceEventBroker(db_file)
+        db_file = db_file
+        self.tb_name = "maintenance_event"
+        self._get_broker = lambda : MaintenanceEventBroker(db_file,
+                                                           timeout,
+                                                           logger)
 
     @staticmethod
-    def get_scheduler():
-        return MaintenanceScheduler()
+    def get_scheduler(timeout=30.0, logger=None, conf=None):
+        if conf:
+            db_file = conf.get("event_db", ":memory:")
+            return MaintenanceScheduler(db_file, timeout, logger)
 
     def create_event(self, services, when, duration):
         broker = self._get_broker()
-        broker.initialize()
         try:
-            with broker.broker as broker:
+            with broker.broker(self.tb_name) as broker:
                 broker.add_record(services, when, duration)
                 return broker.max_id
         except DBConnectionError:
@@ -511,15 +549,15 @@ class MaintenanceScheduler(object):
         broker = self._get_broker()
         if isinstance(e_id, int):
             try:
-                with broker.broker as broker:
-                    if e_id < -1 or e_id > broker.max_id:
+                with broker.broker(self.tb_name) as broker:
+                    if e_id < -1:
                         raise InvalidIDError(e_id)
                     return broker.get_record(e_id)
             except DBConnectionError:
                 raise
         elif isinstance(e_id, str) and e_id.lower() == 'all':
             try:
-                with broker.broker as broker:
+                with broker.broker(self.tb_name) as broker:
                     return broker.all_records
             except DBConnectionError:
                 raise
@@ -530,8 +568,8 @@ class MaintenanceScheduler(object):
                      when=None, duration=None, state=None):
         broker = self._get_broker()
         try:
-            with broker.broker as broker:
-                broker.update_record(e_id, services, when, duration)
+            with broker.broker(self.tb_name) as broker:
+                broker.update_record(e_id, services, when, duration, state)
             return e_id
         except Exception:
             raise
@@ -541,7 +579,7 @@ class MaintenanceScheduler(object):
             raise InvalidIDError(e_id)
         broker = self._get_broker()
         try:
-            with broker.broker as broker:
+            with broker.broker(self.tb_name) as broker:
                 broker.delete_record(e_id)
         except DBConnectionError:
             raise
@@ -572,15 +610,16 @@ class MaintenanceScheduler(object):
         """
         if events:
             d = OrderedDict()
-            for e in events:
-                d.update({e[k]:{k:e[k] for k in e.keys() if k != 'id'}
-                          for k in e.keys() if k == 'id'})
+            d.update({e['id']:{k:e[k] for k in e.keys() if k != 'id'}
+                      for e in events})
             for k in d.keys():
                 d[k]['services'] = d[k]['services'].split(', ')
             return d
+        else:
+            return dict()
 
     def backup_db(self, backup_dir):
-        with self._get_broker().broker as broker:
+        with self._get_broker().broker() as broker:
             try:
                 broker.backup(backup_dir)
             except Exception:
@@ -597,27 +636,36 @@ class SimpleAuth(object):
     @algorithm: the hash algorithm to use, default algorithm is md5
     @expires: life of a token, default value is 86400 seconds(equals to 24h)
     """
-    def __init__(self, algorithm='md5', expires=86400):
+    def __init__(self,
+                 db_file,
+                 algorithm='md5',
+                 expires=86400,
+                 timeout=30.0,
+                 logger=None):
         super(SimpleAuth, self).__init__()
         self.token_life = expires
-        db_file = Config.get_config().auth_db
-        self._get_broker = lambda : AuthBroker(db_file)
+        db_file = db_file
+        self.logger = logger or logging.getLogger(__name__)
+        self._get_broker = lambda : AuthBroker(db_file, timeout, logger)
         self.hash = getattr(hashlib, algorithm.lower(), hashlib.md5)
 
     @staticmethod
-    def get_simple_auth():
-        algorithm = Config.get_config().algorithm or 'md5'
-        expires = Config.get_config().expires or 86400
-        return SimpleAuth(algorithm, expires)
+    def get_simple_auth(timeout=30.0, logger=None, conf=None):
+        if conf:
+            algorithm = conf.get("algorithm", "md5")
+            expires = conf.get("expires", 86400)
+            auth_db = conf.get("auth_db", ":memory:")
+            return SimpleAuth(auth_db, algorithm, expires, timeout, logger)
 
     @Cache()
-    def get_token(self, user, passwd):
+    def get_token(self, conf, user, passwd):
         def _validate_user_and_passwd():
-            u = Config.get_config().user
-            p = Config.get_config().passwd
+            u = conf.get("user")
+            p = conf.get("passwd")
             if user != u:
                 raise InvalidUserError(user)
-            elif passwd != decrypt('devops', p):
+            #elif passwd != decrypt('devops', p):
+            elif passwd != p:
                 raise InvalidPasswdError(passwd)
         try:
             _validate_user_and_passwd()
@@ -631,18 +679,16 @@ class SimpleAuth(object):
         expires = long(time() + self.token_life)
         broker = self._get_broker()
         try:
-            with broker.broker as broker:
+            with broker.broker("auth") as broker:
                 broker.add_token(user, token, expires)
-        except DBConnectionError: # DB does not exist
-            broker.initialize()
-            broker.add_token(user, token, expires)
-
+        except DBConnectionError:
+            raise
         return token
 
     def validate_token(self, token):
         broker = self._get_broker()
         try:
-            with broker.broker as broker:
+            with broker.broker("auth") as broker:
                 info = broker.get_token_info(token)
                 if not info:
                     raise InvalidTokenError(None, token)
@@ -656,7 +702,7 @@ class SimpleAuth(object):
             raise
 
     def backup_db(self, backup_dir):
-        with self._get_broker().broker as broker:
+        with self._get_broker().broker() as broker:
             try:
                 broker.backup(backup_dir)
             except Exception:
